@@ -3,7 +3,6 @@ using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using System.Numerics;
 using Map = FFXIVClientStructs.FFXIV.Client.Game.UI.Map;
 using MapMarkerData = FFXIVClientStructs.FFXIV.Client.Game.UI.MapMarkerData;
-using MarkerInfo = FFXIVClientStructs.FFXIV.Client.Game.UI.MarkerInfo;
 using Sheet = Lumina.Excel.Sheets;
 using TerritoryIntendedUse = FFXIVClientStructs.FFXIV.Client.Enums.TerritoryIntendedUse;
 
@@ -51,9 +50,9 @@ internal sealed class Zone : IZone
         MapSheet            = dataManager.GetExcelSheet<Sheet.Map>().GetRow(zoneId);
         Type                = (TerritoryIntendedUse)MapSheet.TerritoryType.Value.TerritoryIntendedUse.RowId;
         TerritoryId         = MapSheet.TerritoryType.RowId;
-        Name                = GetHousingZoneName() ?? MapSheet.PlaceName.Value.Name.ExtractText();
-        SubName             = MapSheet.PlaceNameSub.Value.Name.ExtractText();
-        RegionName          = MapSheet.PlaceNameRegion.Value.Name.ExtractText();
+        Name                = GetHousingZoneName() ?? MapSheet.PlaceName.Value.Name.ToString();
+        SubName             = MapSheet.PlaceNameSub.Value.Name.ToString();
+        RegionName          = MapSheet.PlaceNameRegion.Value.Name.ToString();
         Offset              = new(MapSheet.OffsetX, MapSheet.OffsetY);
         SizeFactor          = MapSheet.SizeFactor;
         IsSanctuary         = false;
@@ -90,7 +89,7 @@ internal sealed class Zone : IZone
 
         IsSanctuary = territoryInfo->InSanctuary;
         InstanceId  = UIState.Instance()->PublicInstance.InstanceId;
-        Name = GetHousingZoneName() ?? MapSheet.PlaceName.Value.Name.ExtractText();
+        Name = GetHousingZoneName() ?? MapSheet.PlaceName.Value.Name.ToString();
 
         HousingManager* housingManager = HousingManager.Instance();
 
@@ -98,7 +97,7 @@ internal sealed class Zone : IZone
             CurrentDistrictName = _dataManager
                     .GetExcelSheet<Sheet.PlaceName>()
                     .FindRow(territoryInfo->AreaPlaceNameId)
-                    ?.Name.ExtractText()
+                    ?.Name.ToString()
                 ?? "???";
         } else {
             CurrentDistrictName = GetHousingDistrictName();
@@ -120,14 +119,11 @@ internal sealed class Zone : IZone
                 DynamicMarkers.Add(m);
             }
 
-            DynamicMarkers.AddRange(
-                map->ActiveLevequestMarker
-                    .MarkerData
-                    .ToList()
-                    .Where(m => m.MapId == Id)
-                    .Select(m => _markerFactory.FromMapMarkerData(MapSheet, m))
-                    .ToList()
-            );
+            foreach (var markerData in map->ActiveLevequestMarker.MarkerData) {
+                if (markerData.MapId == Id) {
+                    DynamicMarkers.Add(_markerFactory.FromMapMarkerData(MapSheet, markerData));
+                }
+            }
 
             TryAddDynamicMarkers(() => map->CustomTalkMarkers.ToList().SelectMany(i => i.MarkerData.ToList()));
 
@@ -147,7 +143,7 @@ internal sealed class Zone : IZone
         }
 
         lock (WeatherForecast) {
-            WeatherForecast = _forecastProvider.GetWeatherForecast((ushort)TerritoryId);
+            _forecastProvider.UpdateWeatherForecast(WeatherForecast, (ushort)TerritoryId);
 
             if (WeatherForecast.Count > 0) {
                 var    time       = WeatherForecast[0].Time;
@@ -190,7 +186,7 @@ internal sealed class Zone : IZone
         if (!_dataManager.Excel.GetSheet<Sheet.TerritoryType>().TryGetRow(housingTerritoryTypeId, out var territory))
             return null;
 
-        return territory.Map.ValueNullable?.PlaceName.ValueNullable?.Name.ExtractText();
+        return territory.Map.ValueNullable?.PlaceName.ValueNullable?.Name.ToString();
     }
 
     private unsafe string GetHousingDistrictName()
