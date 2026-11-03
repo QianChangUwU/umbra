@@ -220,7 +220,7 @@ jobs:
               "DownloadLinkInstall": base + "/latest.zip",
               "DownloadLinkUpdate": base + "/latest.zip",
               "DownloadLinkTesting": base + "/latest.zip",
-              "RepoUrl": "https://github.com/QianChangUwU/umbra",
+              "RepoUrl": manifest.get("RepoUrl", "https://github.com/QianChangUwU/umbra"),
               "IconUrl": "",
               "Tags": manifest.get("Tags", []),
               "ApplicableVersion": "any",
