@@ -1,63 +1,244 @@
-name: release
+name: Auto release on main push
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force create release even if tag exists'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    runs-on: windows-latest
-
+  detect-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      should-release: ${{ steps.check-release.outputs.should-release }}
+      tag-exists: ${{ steps.check-tag.outputs.exists }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+
+      - name: Extract version from csproj
+        id: get-version
+        run: |
+          VERSION=$(grep -oP '<Version>\K[^<]+' Umbra/Umbra.csproj | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not extract version from Umbra/Umbra.csproj"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if tag already exists
+        id: check-tag
+        run: |
+          TAG="v${{ steps.get-version.outputs.version }}"
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag $TAG already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag $TAG does not exist"
+          fi
+
+      - name: Determine if release should be created
+        id: check-release
+        run: |
+          FORCE_RELEASE="${{ github.event.inputs.force_release }}"
+          TAG_EXISTS="${{ steps.check-tag.outputs.exists }}"
+          if [ "$FORCE_RELEASE" = "true" ] || [ "$TAG_EXISTS" = "false" ]; then
+            echo "should-release=true" >> $GITHUB_OUTPUT
+            echo "Will create release"
+          else
+            echo "should-release=false" >> $GITHUB_OUTPUT
+            echo "Will not create release (tag exists and not forced)"
+          fi
+
+  build-and-release:
+    needs: detect-version-change
+    if: needs.detect-version-change.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.detect-version-change.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
           submodules: recursive
 
-      - name: Setup .NET
+      - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: 10.0.x
 
-      - name: Download Dalamud
-        shell: pwsh
+      - name: Generate changelog
+        id: changelog
         run: |
-          Invoke-WebRequest -Uri https://github.com/Dalamud-DailyRoutines/Dalamud/releases/latest/download/latest.7z -OutFile latest.7z
-          $paths = @(
-            "$env:AppData\XIVLauncher\addon\Hooks\dev",
-            "$env:AppData\XIVLauncherCN\addon\Hooks\dev"
-          )
-          foreach ($path in $paths) {
-            New-Item -ItemType Directory -Force -Path $path | Out-Null
-            & 7z x -y "latest.7z" "-o$path" | Out-Null
-            Write-Host "Dalamud extracted to: $path"
-          }
-          Remove-Item latest.7z -Force
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            PREV_TAG=$(git describe --tags --abbrev=0)
+            CHANGELOG=$(git log --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD")
+          else
+            CHANGELOG=$(git log --pretty=format:'- %s (%h)' -20)
+          fi
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
-      - name: Build Release
-        shell: pwsh
-        run: dotnet build Umbra.sln -c Release -v minimal
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
-      - name: Ensure artifact exists
-        shell: pwsh
+      - name: Download and setup Dalamud
         run: |
-          $source = 'out/Release/Umbra/latest.zip'
-          $target = 'out/Release/Umbra/Umbra.zip'
-          if (!(Test-Path $source)) {
-            throw "未找到构建产物: $source"
-          }
-          Copy-Item $source $target -Force
-          Get-Item $target | Format-List FullName, Length, LastWriteTime
+          echo "Downloading Dalamud (CN distribution)..."
+          wget -q https://github.com/Dalamud-DailyRoutines/Dalamud/releases/latest/download/latest.7z -O dalamud.7z
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+          mkdir -p .dalamud
+          7z x -y dalamud.7z -o.dalamud > /dev/null
+          echo "DALAMUD_HOME=$PWD/.dalamud/" >> $GITHUB_ENV
+          ls -la .dalamud | head
 
-      - name: Upload Umbra.zip to release
+      - name: Restore NuGet packages
+        run: dotnet restore Umbra.sln -p:Configuration=Release -p:EnableWindowsTargeting=true
+
+      - name: Build project
+        run: dotnet build Umbra.sln -c Release --no-restore -p:EnableWindowsTargeting=true
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p release
+          ZIP=$(find out -name 'latest.zip' -print -quit)
+          JSON=$(find out -name 'Umbra.json' -path '*Umbra/Umbra.json' -print -quit)
+          if [ -z "$ZIP" ]; then
+            echo "Error: latest.zip not found"
+            exit 1
+          fi
+          cp "$ZIP" release/latest.zip
+          if [ -n "$JSON" ]; then
+            cp "$JSON" release/Umbra.json
+          fi
+          ls -la release/
+
+      - name: Create and push tag
+        run: |
+          TAG="v${VERSION}"
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          if [ "${{ needs.detect-version-change.outputs.tag-exists }}" = "true" ]; then
+            echo "Deleting existing tag $TAG"
+            git tag -d $TAG || true
+            git push origin :refs/tags/$TAG || true
+          fi
+          git tag $TAG -m "Release version ${VERSION}"
+          git push origin $TAG
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: out/Release/Umbra/Umbra.zip
-          name: ${{ github.ref_name }}
-          fail_on_unmatched_files: true
-          append_body: true
-          overwrite_files: true
+          tag_name: v${{ env.VERSION }}
+          name: "Umbra XIV v${{ env.VERSION }}"
+          body: |
+            ## Umbra XIV v${{ env.VERSION }}
+
+            This release was automatically created following a version bump.
+
+            ### Changes in this release
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Installation Files
+            - `latest.zip` - **Plugin archive for installation**
+            - `Umbra.json` - Plugin manifest
+          files: |
+            release/*
+          draft: false
+          prerelease: false
+
+      - name: Check plugin repo token
+        id: plugin-token
+        env:
+          PLUGIN_TOKEN: ${{ secrets.PLUGIN_REPO_TOKEN }}
+        run: |
+          if [ -n "$PLUGIN_TOKEN" ]; then
+            echo "has-token=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-token=false" >> $GITHUB_OUTPUT
+            echo "PLUGIN_REPO_TOKEN is not set, skipping DalamudPlugins publish"
+          fi
+
+      - name: Publish to DalamudPlugins
+        if: steps.plugin-token.outputs.has-token == 'true'
+        env:
+          PLUGIN_TOKEN: ${{ secrets.PLUGIN_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${PLUGIN_TOKEN}@github.com/QianChangUwU/DalamudPlugins.git plugins-repo
+          mkdir -p plugins-repo/Plugins/Umbra
+          cp release/latest.zip plugins-repo/Plugins/Umbra/latest.zip
+          cp release/Umbra.json plugins-repo/Plugins/Umbra/Umbra.json
+          python3 - <<'PY'
+          import json, os, time
+
+          with open("release/Umbra.json", encoding="utf-8") as f:
+              manifest = json.load(f)
+          version = os.environ["VERSION"]
+          path = "plugins-repo/pluginmaster.json"
+          base = "https://raw.githubusercontent.com/QianChangUwU/DalamudPlugins/main/Plugins/Umbra"
+
+          with open(path, encoding="utf-8") as f:
+              data = json.load(f)
+
+          entry = {
+              "Name": manifest.get("Name", "Umbra XIV"),
+              "Author": manifest.get("Author", "Una, QiongHHHZZZ"),
+              "Punchline": manifest.get("Punchline", ""),
+              "Description": manifest.get("Description", ""),
+              "InternalName": "Umbra",
+              "AssemblyVersion": version,
+              "TestingAssemblyVersion": version,
+              "DalamudApiLevel": manifest.get("DalamudApiLevel", 15),
+              "TestingDalamudApiLevel": manifest.get("DalamudApiLevel", 15),
+              "DownloadLinkInstall": base + "/latest.zip",
+              "DownloadLinkUpdate": base + "/latest.zip",
+              "DownloadLinkTesting": base + "/latest.zip",
+              "RepoUrl": "https://github.com/QianChangUwU/umbra",
+              "IconUrl": "",
+              "Tags": manifest.get("Tags", []),
+              "ApplicableVersion": "any",
+              "LoadPriority": 0,
+              "AcceptsFeedback": True,
+              "LastUpdate": int(time.time()),
+          }
+
+          data = [e for e in data if e.get("InternalName") != "Umbra"]
+          data.append(entry)
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=4)
+              f.write("\n")
+          PY
+          cd plugins-repo
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add .
+          git commit -m "Update Umbra to v${VERSION}"
+          git push
