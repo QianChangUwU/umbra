@@ -24,6 +24,10 @@ internal partial class Toolbar
 {
     private readonly Node _toolbarNode = UmbraDrawing.DocumentFrom("umbra.toolbar.xml").RootNode!;
 
+    private float _cachedCenterWidth;
+    private int   _appliedLeftWidth;
+    private int   _appliedRightWidth;
+
     public Node? GetPanel(string id) =>
         id.StartsWith("aux")
             ? auxBars.FindOrMigrate(id)
@@ -47,7 +51,12 @@ internal partial class Toolbar
             Vector2 workPos  = ImGui.GetMainViewport().WorkPos;
             Vector2 workSize = ImGui.GetMainViewport().WorkSize;
 
-            auxBarNode.ComputeBoundingSize();
+            // The bounds are only stale when something actually invalidated the
+            // layout. Skipping the recompute otherwise avoids a full-tree pass
+            // every frame just to read a size that has not changed.
+            if (auxBarNode.NeedsReflow) {
+                auxBarNode.ComputeBoundingSize();
+            }
 
             float xPos = config.XAlign switch {
                 "Center" => (ToolbarXPosition - (auxBarNode.Bounds.MarginSize.Width / 2f)) + config.XPos,
@@ -100,29 +109,75 @@ internal partial class Toolbar
         CenterPanel.Style.Gap      = ItemSpacing;
         RightPanel.Style.Gap       = ItemSpacing;
 
-        LeftPanel.Style.Size   = new();
-        CenterPanel.Style.Size = new();
-        RightPanel.Style.Size  = new();
-
         if (_toolbarNode.ClassList.Contains("stretched")) {
-            LeftPanel.ComputeBoundingSize();
-            CenterPanel.ComputeBoundingSize();
-            RightPanel.ComputeBoundingSize();
-
-            float centerX1 = (ToolbarXPosition - (CenterPanel.Bounds.MarginSize.Width / 2f));
-            float centerX2 = (ToolbarXPosition + (CenterPanel.Bounds.MarginSize.Width / 2f));
-
-            LeftPanel.Style.Size.Width  = (int)centerX1 - 1;
-            LeftPanel.Style.AutoSize    = (AutoSize.Fit, AutoSize.Grow);
-            RightPanel.Style.Size.Width = (int)(ImGui.GetMainViewport().WorkSize.X - centerX2) - 1;
-            RightPanel.Style.AutoSize   = (AutoSize.Fit, AutoSize.Grow);
+            ApplyStretchedPanelWidths();
         } else {
+            ResetPanelWidths();
+
             LeftPanel.Style.AutoSize   = (AutoSize.Fit, AutoSize.Grow);
             CenterPanel.Style.AutoSize = (AutoSize.Fit, AutoSize.Grow);
             RightPanel.Style.AutoSize  = (AutoSize.Fit, AutoSize.Grow);
         }
 
         _toolbarNode.Render(drawList, new(ToolbarXPosition, (int)(ToolbarYPosition + _autoHideYOffset)));
+
+        if (_toolbarNode.ClassList.Contains("stretched")) {
+            _cachedCenterWidth = CenterPanel.Bounds.MarginSize.Width;
+        }
+    }
+
+    /// <summary>
+    /// Sizes the left and right panels so that they reach the screen edges while
+    /// leaving room for the center panel.
+    /// </summary>
+    /// <remarks>
+    /// The center width is measured from the previous frame's layout instead of
+    /// being recomputed up front. Laying out the panels separately only to throw
+    /// that work away during the actual render costs a full tree pass per panel
+    /// per frame; the one-frame lag is not observable.
+    /// </remarks>
+    private void ApplyStretchedPanelWidths()
+    {
+        float centerWidth = _cachedCenterWidth > 0 ? _cachedCenterWidth : CenterPanel.Bounds.MarginSize.Width;
+
+        if (centerWidth <= 0) {
+            ResetPanelWidths();
+            LeftPanel.Style.AutoSize   = (AutoSize.Fit, AutoSize.Grow);
+            CenterPanel.Style.AutoSize = (AutoSize.Fit, AutoSize.Grow);
+            RightPanel.Style.AutoSize  = (AutoSize.Fit, AutoSize.Grow);
+            return;
+        }
+
+        float centerX1 = ToolbarXPosition - (centerWidth / 2f);
+        float centerX2 = ToolbarXPosition + (centerWidth / 2f);
+
+        SetPanelWidth(LeftPanel, (int)centerX1 - 1, ref _appliedLeftWidth);
+        SetPanelWidth(RightPanel, (int)(ImGui.GetMainViewport().WorkSize.X - centerX2) - 1, ref _appliedRightWidth);
+
+        LeftPanel.Style.AutoSize   = (AutoSize.Fit, AutoSize.Grow);
+        RightPanel.Style.AutoSize  = (AutoSize.Fit, AutoSize.Grow);
+        CenterPanel.Style.AutoSize = (AutoSize.Fit, AutoSize.Grow);
+    }
+
+    private static void SetPanelWidth(Node panel, int width, ref int appliedWidth)
+    {
+        if (appliedWidth == width) return;
+
+        appliedWidth          = width;
+        panel.Style.Size      = new(width, 0);
+    }
+
+    private void ResetPanelWidths()
+    {
+        if (_appliedLeftWidth == 0 && _appliedRightWidth == 0) return;
+
+        _appliedLeftWidth  = 0;
+        _appliedRightWidth = 0;
+        _cachedCenterWidth = 0;
+
+        LeftPanel.Style.Size   = new();
+        CenterPanel.Style.Size = new();
+        RightPanel.Style.Size  = new();
     }
 
     /// <summary>

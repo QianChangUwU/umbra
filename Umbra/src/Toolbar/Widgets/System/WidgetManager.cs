@@ -23,6 +23,7 @@ internal sealed partial class WidgetManager : IDisposable
 
     private byte _lastJobId;
     private bool _quickAccessEnabled;
+    private int  _updateCursor;
 
     public WidgetManager(Toolbar toolbar, IPlayer player, UmbraDelvClipRects clipRects)
     {
@@ -299,7 +300,7 @@ internal sealed partial class WidgetManager : IDisposable
         }
     }
 
-    [OnTick(interval: 16)]
+    [OnTick(interval: 33)]
     private void OnUpdateWidgets()
     {
         byte jobId = Player.JobId;
@@ -310,7 +311,9 @@ internal sealed partial class WidgetManager : IDisposable
             return;
         }
 
-        foreach (var widget in _instances.Values.ToImmutableArray()) {
+        var instances = _instances.Values.ToImmutableArray();
+
+        foreach (var widget in instances) {
             if (widget.Node.ParentNode is null) continue;
 
             string panelId = widget.Node.ParentNode!.Id!;
@@ -328,9 +331,39 @@ internal sealed partial class WidgetManager : IDisposable
                 OnWidgetRelocated?.Invoke(widget, panelId);
             }
 
-            widget.Update();
             widget.Node.SortIndex = widget.SortIndex;
         }
+
+        UpdateWidgetSlice(instances);
+    }
+
+    /// <summary>
+    /// Refreshes half of the widget instances per tick, cycling through the list
+    /// so that every widget is updated at least once per two ticks.
+    /// </summary>
+    /// <remarks>
+    /// Updating every widget in the same tick concentrates their data reads and
+    /// text repaints into a single frame. Splitting the work across ticks keeps
+    /// the per-frame cost roughly halved without changing how fresh the data is,
+    /// since a full cycle still completes in two ticks.
+    /// </remarks>
+    private void UpdateWidgetSlice(ImmutableArray<ToolbarWidget> instances)
+    {
+        if (instances.Length == 0) return;
+
+        int sliceSize = Math.Max(1, (instances.Length + 1) / 2);
+
+        if (_updateCursor >= instances.Length) _updateCursor = 0;
+
+        for (var i = 0; i < sliceSize; i++) {
+            ToolbarWidget widget = instances[(_updateCursor + i) % instances.Length];
+
+            if (widget.Node.ParentNode is null) continue;
+
+            widget.Update();
+        }
+
+        _updateCursor = (_updateCursor + sliceSize) % instances.Length;
     }
 
     private void ToggleQuickAccessBindings()
